@@ -51,7 +51,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope_wrapper
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -66,9 +66,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
-    get_bool_env_var,
     is_cuda,
-    is_hip,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
 )
@@ -79,8 +77,7 @@ _is_flashinfer_available = is_flashinfer_available()
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
-_is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
@@ -244,16 +241,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 )
 
     def op_experts(self, state):
-        state.hidden_states_experts_output = self.experts.run_moe_core(
+        state.combine_input = self.experts.run_moe_core(
             dispatch_output=state.dispatch_output,
         )
 
     def op_combine_a(self, state):
         if self.ep_size > 1:
             self.experts.dispatcher.combine_a(
-                hidden_states=state.pop("hidden_states_experts_output"),
-                topk_ids=state.dispatch_output.topk_ids,
-                topk_weights=state.dispatch_output.topk_weights,
+                combine_input=state.pop("combine_input"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
             state.pop("dispatch_output")
@@ -336,11 +331,7 @@ class Qwen3MoeAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        self.rope_scaling = rope_scaling
-        if _use_aiter and self.rope_scaling is not None:
-            self.rope_scaling["aiter_rope_fused_qknorm"] = True
-
-        self.rotary_emb = get_rope_wrapper(
+        self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
@@ -405,41 +396,26 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if (
-            (isinstance(hidden_states, tuple) and hidden_states[0].shape[0] == 0)
-             or (isinstance(hidden_states, torch.Tensor) and hidden_states.shape[0] == 0)
-        ):
+        if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
-        if _use_aiter and self.rope_scaling is not None and "aiter_rope_fused_qknorm" in self.rope_scaling:
-            assert self.k_norm.variance_epsilon == self.q_norm.variance_epsilon
-            q, k, v = self.rotary_emb(
-                qkv,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                positions,
-                self.num_heads,
-                self.num_kv_heads,
-                self.k_norm.variance_epsilon,
-            )
-        else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self._apply_qk_norm(q, k)
-            q, k = self.rotary_emb(
-                positions,
-                q,
-                k,
-                fused_set_kv_buffer_arg=(
-                    create_fused_set_kv_buffer_arg(
-                        value=v,
-                        layer=self.attn,
-                        forward_batch=forward_batch,
-                    )
-                    if enable_fused_set_kv_buffer(forward_batch)
-                    and self.compatible_with_fused_kv_buffer
-                    else None
-                ),
-            )
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self._apply_qk_norm(q, k)
+        q, k = self.rotary_emb(
+            positions,
+            q,
+            k,
+            fused_set_kv_buffer_arg=(
+                create_fused_set_kv_buffer_arg(
+                    value=v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                if enable_fused_set_kv_buffer(forward_batch)
+                and self.compatible_with_fused_kv_buffer
+                else None
+            ),
+        )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -562,21 +538,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if _use_aiter and self.self_attn.qkv_proj.weight.dtype == getattr(torch, "float8_e4m3fnuz", None):
-            quant_format = "fp8_e4m3fnuz"
-        else:
-            quant_format = ""
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-            quant_format,
+            hidden_states, residual, forward_batch
         )
-        if (
-            (isinstance(hidden_states, tuple) and hidden_states[0].shape[0] != 0)
-             or (isinstance(hidden_states, torch.Tensor) and hidden_states.shape[0] != 0)
-        ):
+
+        if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,

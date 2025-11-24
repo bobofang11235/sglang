@@ -30,7 +30,7 @@ from sglang.srt.configs.qwen3_omni import (
     Qwen3OmniMoeVisionEncoderConfig,
 )
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import VisionAttention, VisionForwardMetadata
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -283,7 +283,23 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
             -1, dtype=torch.int32
         )
 
-        for encoder_layer in self.layers:
+        # Initialize vision_forward_metadata for audio processing
+        # Following the same pattern as qwen3_vl.py
+        for i, encoder_layer in enumerate(self.layers):
+            if i == 0:
+                # First layer: manually create and set metadata
+                # (audio doesn't have grid_thw/pixel_values like vision)
+                seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+                max_seqlen = seq_lens.max().item()
+                vision_forward_metadata = VisionForwardMetadata(
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                )
+                encoder_layer.self_attn.vision_forward_metadata = vision_forward_metadata
+            else:
+                # Other layers: reuse the metadata from first layer
+                encoder_layer.self_attn.set_vision_forward_metadata(vision_forward_metadata)
+            
             layer_outputs = encoder_layer(
                 hidden_states,
                 cu_seqlens,
