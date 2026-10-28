@@ -97,6 +97,7 @@ command=(
   --speculative-eagle-topk 1
   --speculative-num-draft-tokens 4
   --speculative-moe-runner-backend triton
+  --mm-feature-transport cuda_ipc
 )
 
 # Use an explicit negative flag for the control run so the A/B result cannot be
